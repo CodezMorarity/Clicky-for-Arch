@@ -20,6 +20,7 @@ from __future__ import annotations
 import threading
 import time
 from typing import Callable, Optional
+from desktop import is_wayland
 
 
 class WorkflowCapture:
@@ -35,9 +36,12 @@ class WorkflowCapture:
         return self._is_running
 
     def start(self) -> bool:
+        if is_wayland():
+            # pynput sees only XWayland clients and would silently miss native apps.
+            return False
         try:
             from pynput import mouse, keyboard   # type: ignore
-        except ImportError:
+        except (ImportError, OSError):
             return False
         self._events = []
         self._t0 = time.monotonic()

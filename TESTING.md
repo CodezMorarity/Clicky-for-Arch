@@ -1,4 +1,14 @@
-﻿# Clicky â€” Feature Testing Guide
+# Linux desktop validation
+
+The Linux regression suite runs with `.venv/bin/python -m pytest -q`.
+Run `.venv/bin/ruff check .` and `.venv/bin/python -m pip check` alongside it.
+The [Linux guide](docs/LINUX_SETUP.md#verify-or-troubleshoot) covers live desktop
+checks and the opt-in complete voice/capture/model/speech test. The
+[migration report](docs/LINUX_MIGRATION.md) distinguishes verified behavior
+from remaining platform and upstream limitations. The original manual
+Windows checks follow below.
+
+# Clicky â€” Feature Testing Guide
 
 How to verify every feature works. Go top-to-bottom; each section is independent.
 

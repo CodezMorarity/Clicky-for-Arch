@@ -2,7 +2,11 @@ import threading
 import time
 from typing import Callable
 
-import keyboard
+from desktop import is_windows, is_hyprland, is_wayland, is_x11
+
+keyboard = None
+if is_windows():
+    import keyboard
 
 from config import cfg
 
@@ -87,8 +91,26 @@ class GlobalHotkeyMonitor:
         # a missed first evaluation would never be retried.
         self._need = {_norm_token(p) for p in self._parts}
         self._down: set = set()
+        self._adapter = None
 
     def start(self):
+        if is_hyprland():
+            from desktop.shortcuts import HyprShortcut
+            self._adapter = HyprShortcut(self._hotkey, self._on_press, self._on_release)
+            self._adapter.start()
+            return
+        if is_wayland():
+            from desktop.portals import PortalShortcut
+            self._adapter = PortalShortcut(self._hotkey, self._on_press, self._on_release)
+            self._adapter.start()
+            return
+        if is_x11():
+            from desktop.x11 import PynputShortcut
+            self._adapter = PynputShortcut(self._hotkey, self._on_press, self._on_release)
+            self._adapter.start()
+            return
+        if keyboard is None:
+            raise RuntimeError("No supported global shortcut backend is available. Use the panel's talk button.")
         if self._modifier_only:
             # No terminal key — watch the global key stream and track state.
             self._hook_handle = keyboard.hook(self._on_any_event)
@@ -150,6 +172,11 @@ class GlobalHotkeyMonitor:
             self._on_release()
 
     def stop(self):
+        if self._adapter:
+            self._adapter.stop()
+            self._adapter = None
+        if keyboard is None:
+            return
         if self._hook_handle is not None:
             try:
                 keyboard.unhook(self._hook_handle)
@@ -170,6 +197,31 @@ class StopHotkey:
     def __init__(self, on_stop: Callable[[], None], key: str = "esc"):
         self._on_stop = on_stop
         self._key = key
+        self._adapter = None
+        self._handle = None
 
     def start(self):
-        keyboard.add_hotkey(self._key, self._on_stop, suppress=False)
+        if is_hyprland():
+            from desktop.shortcuts import HyprShortcut
+            self._adapter = HyprShortcut(self._key, self._on_stop, non_consuming=True)
+            self._adapter.start()
+            return
+        if is_wayland():
+            # The Global Shortcuts portal has no standard pass-through flag.
+            # Leave Escape to the focused app; cancellation stays in the tray.
+            return
+        if is_x11():
+            from desktop.x11 import PynputShortcut
+            self._adapter = PynputShortcut(self._key, self._on_stop)
+            self._adapter.start()
+            return
+        if keyboard is None:
+            return
+        self._handle = keyboard.add_hotkey(self._key, self._on_stop, suppress=False)
+
+    def stop(self):
+        if self._adapter:
+            self._adapter.stop()
+        if keyboard is not None and self._handle is not None:
+            keyboard.remove_hotkey(self._handle)
+            self._handle = None

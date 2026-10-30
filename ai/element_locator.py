@@ -71,6 +71,8 @@ async def detect_element(
     physical_left: int = 0,
     physical_top: int = 0,
     dpi_scale: float = 1.0,
+    logical_left: int | None = None,
+    logical_top: int | None = None,
 ) -> Optional[Detected]:
     """Detect a UI element and return its position in **logical screen
     coordinates** (the same coordinate space Qt's QCursor.pos() uses), with
@@ -164,16 +166,10 @@ async def detect_element(
         px = cu_x / tw * physical_width
         py = cu_y / th * physical_height
 
-        # Stage 2: physical monitor px → physical virtual-screen px
-        # (apply the monitor's origin offset so monitor-2 coords don't land
-        # on monitor-1)
-        vx = px + physical_left
-        vy = py + physical_top
-
-        # Stage 3: physical → logical (Qt cursor space)
+        # Scale local pixels, then add the Qt origin independently of scale.
         scale = dpi_scale if dpi_scale > 0 else 1.0
-        lx = int(round(vx / scale))
-        ly = int(round(vy / scale))
+        lx = int(round(px / scale + (logical_left if logical_left is not None else physical_left / scale)))
+        ly = int(round(py / scale + (logical_top if logical_top is not None else physical_top / scale)))
         return Detected(x=lx, y=ly, screen_index=screen_index)
 
     return None

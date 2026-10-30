@@ -1,11 +1,13 @@
 """
-Clicky for Windows — Entry Point.
+Clicky — Entry Point.
 Boots Qt, spawns overlay+panel+tray, starts ambient mic listener, binds hotkey.
 """
 
 import os
 import sys
 from pathlib import Path
+from desktop import overlay_positioning_available, prepare_qt, open_path
+from desktop.paths import ensure_data_dir
 
 
 def _ensure_std_streams() -> None:
@@ -110,7 +112,7 @@ def _setup_logging():
     import logging
     from logging.handlers import RotatingFileHandler
 
-    log_dir = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "Clicky"
+    log_dir = ensure_data_dir()
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
         handler = RotatingFileHandler(
@@ -131,6 +133,17 @@ def _setup_logging():
 
 
 def main():
+    import argparse
+    from PyQt6.QtCore import QTimer
+    from PyQt6.QtWidgets import QSystemTrayIcon
+    parser = argparse.ArgumentParser(description="Clicky voice and screen assistant")
+    parser.add_argument("--smoke-test", type=float, metavar="SECONDS",
+                        help="Start normally, skip setup, then exit after SECONDS")
+    parser.add_argument("--show-panel", action="store_true")
+    args = parser.parse_args()
+    if args.smoke_test is not None and not 0 < args.smoke_test <= 60:
+        parser.error("--smoke-test must be between 0 and 60 seconds")
+    prepare_qt()
     _setup_logging()
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
@@ -139,6 +152,8 @@ def main():
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("Clicky")
     app.setApplicationDisplayName("Clicky - AI Companion")
+    from desktop.display import attach
+    attach(app)
 
     # ── Core components ───────────────────────────────────────────────────────
     manager = CompanionManager()
@@ -180,9 +195,7 @@ def main():
     # Errors. The toast names the log file because it only has room for the
     # message itself — issue #15 was reported with no traceback simply because
     # nobody knew a log existed.
-    _log_hint = Path(
-        os.environ.get("LOCALAPPDATA", Path.home())
-    ) / "Clicky" / "clicky.log"
+    _log_hint = ensure_data_dir() / "clicky.log"
     manager.sig_error.connect(
         lambda e: tray.show_notification(
             "Clicky error", f"{e}\n\nFull details: {_log_hint}"
@@ -191,6 +204,8 @@ def main():
 
     # Panel → Manager
     panel.on_model_changed.connect(manager.set_model)
+    panel.on_push_to_talk_pressed.connect(manager.on_hotkey_press)
+    panel.on_push_to_talk_released.connect(manager.on_hotkey_release)
 
     def _on_doc_dropped(path: str):
         ok = manager.attach_document(path)
@@ -221,7 +236,7 @@ def main():
         tray.show_notification(
             "Lesson Recording",
             f"Recording to:\n{out}" if out else
-            "Failed — install imageio[ffmpeg]: pip install imageio imageio-ffmpeg"
+            "Recording could not start. Check the Clicky error notification and log."
         )
     def _record_stop():
         out = manager.stop_recording()
@@ -239,7 +254,7 @@ def main():
         tray.show_notification(
             "Workflow Capture",
             "Recording your clicks + keys. Stop from tray when done."
-            if ok else "Install pynput: pip install pynput"
+            if ok else "Workflow input capture requires Windows or an X11 session."
         )
     def _wf_stop():
         summary = manager.workflow_stop()
@@ -265,13 +280,7 @@ def main():
 
     # Journal folder
     def _open_journal():
-        import os, subprocess
-        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-        path = os.path.join(base, "Clicky")
-        try:
-            os.startfile(path)
-        except Exception:
-            subprocess.Popen(["explorer", path])
+        open_path(ensure_data_dir())
     tray.on_journal_open.connect(_open_journal)
 
     # Attach document (drag-drop alternative — file picker)
@@ -370,8 +379,7 @@ def main():
     def _save_diagnostics():
         import datetime, json, platform, traceback
         from ai import ollama_bootstrap as ob
-        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-        out = Path(base) / "Clicky" / f"diagnostics-{datetime.datetime.now():%Y%m%d-%H%M%S}.txt"
+        out = ensure_data_dir() / f"diagnostics-{datetime.datetime.now():%Y%m%d-%H%M%S}.txt"
         try:
             providers_d = cfg.describe()
         except Exception:
@@ -406,28 +414,56 @@ def main():
             out.write_text("\n".join(report), encoding="utf-8")
             tray.show_notification("Diagnostics saved", str(out))
             try:
-                os.startfile(str(out))
+                open_path(out)
             except Exception:
                 pass
         except Exception as e:
             tray.show_notification("Diagnostics failed", str(e))
     tray.on_diagnostics.connect(_save_diagnostics)
 
-    tray.on_quit.connect(lambda: (tray.hide_icon(), manager.shutdown(), app.quit()))
+    tray.on_quit.connect(app.quit)
 
     # ── Global hotkey ─────────────────────────────────────────────────────────
     hotkey = GlobalHotkeyMonitor(
         on_press=manager.on_hotkey_press,
         on_release=manager.on_hotkey_release,
     )
-    hotkey.start()
+    try:
+        hotkey.start()
+        if hotkey._adapter:
+            hotkey._adapter.failed.connect(lambda e: (
+                tray.show_notification("Clicky shortcut unavailable", e), panel.show()))
+    except Exception as exc:
+        tray.show_notification("Clicky shortcut unavailable", str(exc))
+        panel.show()
 
     # Esc = cancel current generation (kills Ollama ramble mid-stream)
     stop_key = StopHotkey(on_stop=manager.stop, key="esc")
-    stop_key.start()
+    try:
+        stop_key.start()
+        if stop_key._adapter:
+            stop_key._adapter.failed.connect(lambda e: tray.show_notification("Clicky stop shortcut unavailable", e))
+    except Exception as exc:
+        tray.show_notification("Clicky stop shortcut unavailable", str(exc))
+
+    def cleanup():
+        stop_key.stop()
+        hotkey.stop()
+        tray.hide_icon()
+        manager.shutdown()
+    app.aboutToQuit.connect(cleanup)
 
     # ── Show UI + start listener ──────────────────────────────────────────────
-    overlay.show()        # persistent overlay (cursor follow)
+    if overlay_positioning_available():
+        overlay.show()    # positioned overlay via X11/XWayland
+    else:
+        tray.show_notification(
+            "Pointer overlay unavailable",
+            "This Wayland session does not provide XWayland positioning. "
+            "The panel and voice features are still available.",
+        )
+    if args.show_panel or not QSystemTrayIcon.isSystemTrayAvailable():
+        panel.show()
     # Panel is hidden by default — user can open it from the tray menu if needed
     manager.start()        # begin ambient mic + wake-word scanning
 
@@ -435,10 +471,10 @@ def main():
     _hk = "+".join(p.strip().capitalize() for p in cfg.hotkey.split("+"))
     tray.show_notification(
         "Clicky is running",
-        (f"Say 'Clicky' or press {_hk}  |  LLM: {providers['llm']}"
+        (f"Say 'Clicky' or use {_hk} if available; the panel talk button also works  |  LLM: {providers['llm']}"
          if cfg.ambient_mic() else
-         f"Press {_hk}, ask your question, and Clicky answers when you stop "
-         f"talking  |  LLM: {providers['llm']}"),
+         f"Use {_hk} if available, ask your question, and Clicky answers when "
+         f"you stop talking. The panel talk button also works  |  LLM: {providers['llm']}"),
     )
 
     # ── First-run setup wizard ────────────────────────────────────────────────
@@ -448,7 +484,9 @@ def main():
         from ui.setup_wizard import maybe_show_setup_wizard, SetupWizard
 
         # Force-show via env var (handy for testing).
-        if os.environ.get("CLICKY_FORCE_SETUP", "").strip() in ("1", "true", "yes"):
+        if args.smoke_test is not None:
+            pass
+        elif os.environ.get("CLICKY_FORCE_SETUP", "").strip() in ("1", "true", "yes"):
             wiz = SetupWizard()
             wiz.show()
             _setup_keepalive[0] = wiz
@@ -459,6 +497,8 @@ def main():
     except Exception as e:
         print(f"[setup-wizard] skipped: {e}")
 
+    if args.smoke_test is not None:
+        QTimer.singleShot(round(args.smoke_test * 1000), app.quit)
     sys.exit(app.exec())
 
 

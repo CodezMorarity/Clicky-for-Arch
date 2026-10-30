@@ -1,4 +1,7 @@
-﻿# Clicky for Windows â€” Setup Guide
+> **Omarchy / Arch Linux:** use [docs/LINUX_SETUP.md](docs/LINUX_SETUP.md).
+> The instructions below describe the original Windows installation.
+
+# Clicky for Windows â€” Setup Guide
 
 ## Prerequisites
 

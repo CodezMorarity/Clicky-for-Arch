@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import AsyncIterator, List, Optional
 
 import httpx
+from desktop.paths import ensure_data_dir
 
 from ai.base_provider import BaseLLMProvider, Message
 
@@ -60,10 +61,7 @@ USER_AGENT     = "GitHubCopilotChat/0.23.1"
 
 
 def _data_dir() -> Path:
-    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    d = Path(base) / "Clicky"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    return ensure_data_dir()
 
 
 def _token_path() -> Path:

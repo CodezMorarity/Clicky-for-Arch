@@ -8,26 +8,38 @@ from __future__ import annotations
 
 import ctypes
 import re
-from ctypes import wintypes
+from desktop import is_hyprland, is_sway, is_windows, is_x11
 
 
 # ── Active-window title (for per-app context memory) ─────────────────────────
 
-def active_window_title() -> str:
+def active_window_title() -> str | None:
+    if is_hyprland():
+        # Propagate IPC failure: an empty title must not silently bypass privacy.
+        from desktop.hyprland import active_title
+        return active_title()
+    if is_sway():
+        from desktop.sway import active_title
+        return active_title()
+    if is_x11():
+        from desktop.x11 import active_title
+        return active_title()
     try:
+        if not is_windows():
+            return None
         u = ctypes.windll.user32
         hwnd = u.GetForegroundWindow()
         if not hwnd:
-            return ""
+            return None
         n = u.GetWindowTextLengthW(hwnd)
         buf = ctypes.create_unicode_buffer(n + 1)
         u.GetWindowTextW(hwnd, buf, n + 1)
-        return buf.value or ""
+        return buf.value or None
     except Exception:
-        return ""
+        return None
 
 
-def app_key(title: str) -> str:
+def app_key(title: str | None) -> str:
     """Reduce a noisy window title to a stable per-app key.
 
     Examples:
@@ -161,5 +173,7 @@ PRIVACY_BLOCKLIST = (
 _PRIVACY_RE = re.compile(PRIVACY_BLOCKLIST, re.IGNORECASE)
 
 
-def is_sensitive_window(title: str) -> bool:
-    return bool(title) and _PRIVACY_RE.search(title) is not None
+def is_sensitive_window(title: str | None) -> bool:
+    # Unknown focus must not silently opt out of the privacy guard. Generic
+    # Wayland capture has an explicit portal approval path in the manager.
+    return title is None or bool(title) and _PRIVACY_RE.search(title) is not None

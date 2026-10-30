@@ -1,37 +1,16 @@
-"""
-Hybrid pointer — Clicky pointing accuracy upgrade.
+"""Local pointer resolution in Qt overlay coordinates.
 
-The original grid-locator was inaccurate because it asked the LLM to guess
-pixel coordinates from a numbered grid overlay. Vision models trained on
-natural images don't have pixel-precise spatial reasoning, so they'd often
-pick a neighboring cell or off-by-one row, sending Clicky's blue cursor to
-the wrong button.
-
-This module uses a three-tier resolver, each tier much more accurate than the next:
-
-  Tier 1  Windows UI Automation (UIA)     ~5 ms     pixel-perfect
-          Walks the OS accessibility tree, finds elements by name/role.
-          Works in every standard UI: Chrome/Edge/Firefox, VS Code, IDEs,
-          Office, Electron apps, native Win32, WinUI/UWP, Settings, etc.
-
-  Tier 2  Offline OCR (RapidOCR/ONNX)     ~300 ms   text-perfect
-          For canvas apps where UIA gives no tree: Figma, Photoshop, games,
-          older Java/Swing UIs. Runs entirely on CPU, no API calls.
-
-  Tier 3  Vision LLM grid fallback        ~1-3 s    best effort
-          Only used when UIA + OCR both whiff. Delegates to the existing
-          element_locator.py — kept as a safety net.
-
-Public API:
-    find_target(query: str) -> Optional[Target]
-
-The caller (companion_manager) treats Target as opaque — it has .center_xy
-in LOGICAL screen pixels, ready to feed directly into the overlay pointer.
+Windows uses UI Automation then RapidOCR. Linux uses Tesseract. OCR runs on
+an existing screenshot so the manager's privacy decision is preserved. The
+manager owns the asynchronous vision fallback when local matching fails.
 """
 
 from __future__ import annotations
 
+import base64
+import io
 import logging
+from desktop import is_windows
 import re
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
@@ -46,7 +25,7 @@ class Target:
     y: int                # center Y
     bbox: Tuple[int, int, int, int]   # (left, top, right, bottom)
     label: str            # what we matched (button text, control type, etc.)
-    source: str           # "uia" | "ocr" | "vision"
+    source: str           # "uia" | "ocr"
     confidence: float     # 0.0–1.0
 
     @property
@@ -266,26 +245,37 @@ def _find_via_ocr(query: str, screenshot_path: Optional[str] = None,
 #  TIER 3 — Vision LLM grid fallback (delegated to existing element_locator)
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _find_via_vision(query: str, screenshot, llm_provider) -> Optional[Target]:
-    """Last-resort: use the grid-locator path (element_locator.py)."""
+def _find_tesseract(query: str, image) -> Optional[Target]:
+    """Find a word or line using the installed Linux OCR engine."""
     try:
-        from ai.element_locator import locate_element  # v1 module
-    except ImportError:
-        log.warning("element_locator not available — Tier 3 (vision) disabled")
-        return None
-
-    try:
-        coord = locate_element(query, screenshot, llm_provider)
-        if not coord:
+        import pytesseract
+        data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT,
+                                        timeout=8)
+        lines = {}
+        candidates = []
+        for i, text in enumerate(data["text"]):
+            if not text.strip() or float(data["conf"][i]) < 40:
+                continue
+            x, y, w, h = (data[k][i] for k in ("left", "top", "width", "height"))
+            item = (text, (x, y, x+w, y+h))
+            candidates.append(item)
+            key = tuple(data[k][i] for k in ("block_num", "par_num", "line_num"))
+            lines.setdefault(key, []).append(item)
+        for words in lines.values():
+            boxes = [w[1] for w in words]
+            candidates.append((" ".join(w[0] for w in words),
+                               (min(b[0] for b in boxes), min(b[1] for b in boxes),
+                                max(b[2] for b in boxes), max(b[3] for b in boxes))))
+        if not candidates:
             return None
-        x, y = coord
-        return Target(
-            x=x, y=y, bbox=(x - 20, y - 20, x + 20, y + 20),
-            label=query, source="vision",
-            confidence=0.5,   # vision is least trustworthy
-        )
-    except Exception as e:
-        log.warning("Vision tier failed: %s", e)
+        text, box = max(candidates, key=lambda c: _score_match(query, c[0], ""))
+        score = _score_match(query, text, "")
+        if score < 0.5:
+            return None
+        l, t, r, b = box
+        return Target((l+r)//2, (t+b)//2, box, text, "ocr", score)
+    except Exception as exc:
+        log.debug("Tesseract pointer unavailable: %s", exc)
         return None
 
 
@@ -303,46 +293,45 @@ def find_target(
     skip_ocr: bool = False,
     skip_vision: bool = False,
 ) -> Optional[Target]:
-    """Resolve a natural-language pointing query into pixel coordinates.
+    """Resolve text with UIA/OCR and return Qt overlay coordinates.
 
-    Tries UIA → OCR → Vision in order. Returns the first hit with confidence
-    >= the tier's threshold. Returns None if all three tiers whiff.
-
-    Args:
-        query:        what the user asked Clicky to point at (e.g. "save button",
-                      "send icon", "login text field").
-        screenshot:   ScreenShot object (from screen.capture) — used by vision tier.
-        pil_image:    PIL.Image of the full screen — used by OCR tier. Optional;
-                      OCR will capture its own if not provided.
-        llm_provider: BaseLLMProvider instance — needed only for vision fallback.
-        skip_*:       Force-skip a tier (for testing or perf-sensitive paths).
-
-    Returns:
-        Target with .center_xy in logical screen pixels, or None.
+    Legacy llm_provider/skip_vision arguments remain accepted for callers;
+    vision is asynchronous and belongs to the companion manager.
     """
     if not query or not query.strip():
         return None
 
-    # Tier 1: UIA — fast, free, often perfect
-    if not skip_uia:
-        t = _find_via_uia(query)
-        if t is not None and t.confidence >= 0.5:
-            return t
-
-    # Tier 2: OCR — text-based fallback for canvas apps
-    if not skip_ocr:
-        t = _find_via_ocr(query, pil_image=pil_image)
-        if t is not None and t.confidence >= 0.5:
-            return t
-
-    # Tier 3: vision LLM grid — last resort
-    if not skip_vision and screenshot is not None and llm_provider is not None:
-        t = _find_via_vision(query, screenshot, llm_provider)
-        if t is not None:
-            return t
-
-    log.info("All pointer tiers failed for query: %r", query)
-    return None
+    # Return one coordinate contract: Qt overlay coordinates, including origin.
+    if not skip_uia and is_windows():
+        target = _find_via_uia(query)
+        if target is not None:
+            scale = screenshot.dpi_scale if screenshot else 1.0
+            target.x, target.y = round(target.x / scale), round(target.y / scale)
+            target.bbox = tuple(round(v / scale) for v in target.bbox)
+            return target
+    if skip_ocr:
+        return None
+    if screenshot is None:
+        # Use the shared capture adapter, never an implicit X11 screenshot.
+        from screen.capture import capture_primary
+        screenshot = capture_primary()
+    if screenshot is None:
+        return None
+    from PIL import Image
+    if pil_image is None:
+        pil_image = Image.open(io.BytesIO(base64.b64decode(screenshot.base64_jpeg))).convert("RGB")
+    target = (_find_via_ocr(query, pil_image=pil_image) if is_windows()
+              else _find_tesseract(query, pil_image))
+    if target is None:
+        # The caller already owns the asynchronous vision fallback.
+        return None
+    def convert(x, y):
+        return screenshot.image_to_overlay(x * screenshot.width / pil_image.width,
+                                           y * screenshot.height / pil_image.height)
+    target.x, target.y = convert(target.x, target.y)
+    l, t, r, b = target.bbox
+    target.bbox = (*convert(l, t), *convert(r, b))
+    return target
 
 
 __all__ = ["Target", "find_target"]

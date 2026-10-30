@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
+from desktop.paths import ensure_data_dir
 
 from config import cfg
 
@@ -54,10 +55,7 @@ _FALLBACKS: dict[str, list[dict]] = {
 
 
 def _data_dir() -> Path:
-    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    d = Path(base) / "Clicky"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    return ensure_data_dir()
 
 
 def _cache_path(provider: str) -> Path:

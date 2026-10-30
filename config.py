@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 from dotenv import load_dotenv
+from desktop import is_windows
+from desktop.paths import config_file
 
 # Where the user-editable .env lives. In the PyInstaller build, __file__ is
 # inside the bundle's _internal\ directory but users (and the installer) put
@@ -16,13 +18,16 @@ else:
 
 # Load env files in priority order. .env.local overrides .env (Next.js convention,
 # which is how many users — including this one — keep their real keys).
-for _name in (".env", ".env.local"):
-    _p = _HERE / _name
+_ENV_PATH = config_file(_HERE)
+_sources = [_HERE / ".env", _HERE / ".env.local", _ENV_PATH]
+if os.environ.get("CLICKY_CONFIG_FILE"):
+    _sources = [_ENV_PATH]
+for _p in dict.fromkeys(_sources):
     if _p.exists():
         load_dotenv(_p, override=True)
 
 
-DEFAULT_SYSTEM_PROMPT = """You are Clicky, a VISUAL AI tutor running on Windows. You live
+DEFAULT_SYSTEM_PROMPT = """You are Clicky, a VISUAL AI tutor on the user's desktop. You live
 next to the user's cursor. Your job is to *show*, not just tell.
 
 {{CONTEXT}}
@@ -162,7 +167,9 @@ class Config:
     # App
     # Push-to-talk. Two-key modifier combo — no clash with app shortcuts and
     # easier to hold than a 3-key chord. Override with CLICKY_HOTKEY in .env.
-    hotkey: str = field(default_factory=lambda: os.getenv("CLICKY_HOTKEY", "ctrl+win"))
+    hotkey: str = field(default_factory=lambda: os.getenv(
+        "CLICKY_HOTKEY", "ctrl+win" if is_windows() else "ctrl+alt+space"
+    ))
 
     # Microphone mode:
     #   "hotkey"  (default) — mic opens only while you're asking something.
@@ -237,7 +244,7 @@ class Config:
         name = name.lower()
         os.environ["CLICKY_ACTIVE_LLM"] = name
         # Write to .env so the choice survives restarts
-        env_path = _HERE / ".env"
+        env_path = self.env_path()
         try:
             lines = env_path.read_text(encoding="utf-8").splitlines(keepends=True) if env_path.exists() else []
             key = "CLICKY_ACTIVE_LLM"
@@ -249,7 +256,10 @@ class Config:
                     break
             if not found:
                 lines.append(f"\n{key}={name}\n")
+            env_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             env_path.write_text("".join(lines), encoding="utf-8")
+            if not is_windows():
+                env_path.chmod(0o600)
         except Exception:
             pass  # non-fatal — runtime switch still works via os.environ
 
@@ -271,8 +281,8 @@ class Config:
 
     @staticmethod
     def env_path() -> Path:
-        """The .env Clicky reads and writes — next to Clicky.exe when frozen."""
-        return _HERE / ".env"
+        """Writable settings: XDG on Linux, beside Clicky.exe on Windows."""
+        return _ENV_PATH
 
     def get_api_key(self, env_var: str) -> str:
         attr = self.API_KEY_FIELDS.get(env_var, (None, None))[0]
@@ -319,6 +329,8 @@ class Config:
 
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("".join(out), encoding="utf-8")
+            if not is_windows():
+                path.chmod(0o600)
         except Exception:
             pass  # runtime value still applied; persistence is best-effort
 

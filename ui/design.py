@@ -1,4 +1,7 @@
 from PyQt6.QtGui import QColor, QFont
+from desktop import is_windows
+
+FONT_FAMILY = "Segoe UI" if is_windows() else "Sans Serif"
 
 # ── Palette ───────────────────────────────────────────────────────────────────
 BLUE_GLOW       = QColor(0, 120, 255)
@@ -21,7 +24,7 @@ STATE_SPEAKING  = QColor(255, 140, 0)
 
 # ── Fonts ─────────────────────────────────────────────────────────────────────
 def font(size: int = 13, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
-    f = QFont("Segoe UI", size)
+    f = QFont(FONT_FAMILY, size)
     f.setWeight(weight)
     return f
 

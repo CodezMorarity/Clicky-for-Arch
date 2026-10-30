@@ -215,7 +215,7 @@ async def _ddg_html_search(client: httpx.AsyncClient, query: str) -> list[Tuple[
         out: list[Tuple[str, str]] = []
         for match in _RESULT_LINK_RE.finditer(r.text):
             url = _normalize_ddg_url(match.group(1))
-            title = _strip_html(match.group(2)).strip()
+            title = _html_to_text(match.group(2)).strip()
             if url and title:
                 out.append((title, url))
                 if len(out) >= 4:

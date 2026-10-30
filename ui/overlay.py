@@ -19,6 +19,8 @@ from typing import Optional
 
 from PyQt6.QtWidgets import QWidget, QApplication
 from PyQt6.QtCore import Qt, QTimer, QPointF, QRectF
+from ui.design import FONT_FAMILY
+
 from PyQt6.QtGui import (
     QPainter, QColor, QPen, QBrush, QPainterPath, QCursor, QFont,
 )
@@ -226,10 +228,21 @@ class CursorOverlay(QWidget):
             | Qt.WindowType.Tool
             | Qt.WindowType.WindowTransparentForInput
         )
+        from desktop import is_hyprland
+        if is_hyprland():
+            # Override-redirect keeps the canvas out of the tiling/focus stack.
+            self.setWindowFlags(self.windowFlags()
+                | Qt.WindowType.X11BypassWindowManagerHint
+                | Qt.WindowType.WindowDoesNotAcceptFocus)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self._cover_all_monitors()
+        app = QApplication.instance()
+        app.screenAdded.connect(self._screen_added)
+        app.screenRemoved.connect(lambda _: self._cover_all_monitors())
+        for screen in app.screens():
+            screen.geometryChanged.connect(self._cover_all_monitors)
 
         # Seed position so we don't flash at (0, 0)
         qp = QCursor.pos()
@@ -382,7 +395,13 @@ class CursorOverlay(QWidget):
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
-    def _cover_all_monitors(self):
+    def _screen_added(self, screen):
+        screen.geometryChanged.connect(self._cover_all_monitors)
+        self._cover_all_monitors()
+
+    def _cover_all_monitors(self, *_):
+        if not QApplication.primaryScreen():
+            return
         geo = QApplication.primaryScreen().virtualGeometry()
         for s in QApplication.screens():
             geo = geo.united(s.geometry())
@@ -644,7 +663,7 @@ class CursorOverlay(QWidget):
             p.drawArc(rect, 90 * 16, span)
         label = ann.get("label", "")
         if label and u >= 1.0:
-            f = QFont("Segoe UI", 11, QFont.Weight.Bold)
+            f = QFont(FONT_FAMILY, 11, QFont.Weight.Bold)
             p.setFont(f)
             fm = p.fontMetrics()
             tx = x - fm.horizontalAdvance(label) / 2
@@ -667,7 +686,7 @@ class CursorOverlay(QWidget):
         x = ann["x"] - self.x()
         y = ann["y"] - self.y()
         pt_size = _TEXT_SIZES.get(ann.get("size", "m"), 17)
-        font = QFont("Segoe UI", pt_size, QFont.Weight.Bold)
+        font = QFont(FONT_FAMILY, pt_size, QFont.Weight.Bold)
         p.setFont(font)
         # Ease in: fade + slight rise
         fade = u * alpha
@@ -800,7 +819,7 @@ class CursorOverlay(QWidget):
 
     def _draw_bubble(self, p, cx, cy, label: str):
         """Speech bubble next to the buddy, matches Swift pill style."""
-        font = QFont("Segoe UI", 9, QFont.Weight.Medium)
+        font = QFont(FONT_FAMILY, 9, QFont.Weight.Medium)
         p.setFont(font)
         fm = p.fontMetrics()
 

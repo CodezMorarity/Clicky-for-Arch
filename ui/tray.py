@@ -23,7 +23,9 @@ def _make_tray_icon(color: QColor) -> QIcon:
 
 
 class TrayManager(QObject):
-    """Windows system tray icon and context menu."""
+    """System tray icon and context menu."""
+
+    _notification = pyqtSignal(str, str)
 
     on_show_panel         = pyqtSignal()
     on_hide_panel         = pyqtSignal()
@@ -72,6 +74,7 @@ class TrayManager(QObject):
         }
 
         self._tray = QSystemTrayIcon()
+        self._notification.connect(self._show_notification)
         self._tray.setIcon(self._icons["idle"])
         self._tray.setToolTip(
             f"Clicky - AI Companion\nPress {cfg.hotkey} and just talk"
@@ -255,6 +258,10 @@ class TrayManager(QObject):
         wf_menu = menu.addMenu("Workflow Capture")
         wf_start = wf_menu.addAction("Start capturing my clicks")
         wf_start.triggered.connect(self.on_workflow_start)
+        from desktop import is_wayland
+        if is_wayland():
+            wf_start.setText("Workflow capture unavailable on Wayland")
+            wf_start.setEnabled(False)
         wf_stop  = wf_menu.addAction("Stop + send to Clicky")
         wf_stop.triggered.connect(self.on_workflow_stop)
 
@@ -585,6 +592,9 @@ class TrayManager(QObject):
         self._build_menu()
 
     def show_notification(self, title: str, message: str):
+        self._notification.emit(title, message)
+
+    def _show_notification(self, title: str, message: str):
         self._tray.showMessage(
             title, message, QSystemTrayIcon.MessageIcon.Information, 3000
         )

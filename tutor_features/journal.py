@@ -24,6 +24,7 @@ import sqlite3
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from desktop.paths import ensure_data_dir
 from typing import Optional
 
 
@@ -31,10 +32,7 @@ _INTERVALS_DAYS = (1, 3, 7, 14, 30, 60, 120)
 
 
 def _db_path() -> Path:
-    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    d = Path(base) / "Clicky"
-    d.mkdir(parents=True, exist_ok=True)
-    return d / "journal.db"
+    return ensure_data_dir() / "journal.db"
 
 
 def _connect() -> sqlite3.Connection:

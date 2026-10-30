@@ -254,10 +254,15 @@ class CompanionPanel(QWidget):
         root.addWidget(scroll, stretch=1)
 
         # Push-to-talk button
-        self._ptt_btn = QPushButton(f"Say 'Clicky' or hold {_hotkey_label()}")
+        hint = f"Hold to talk · {_hotkey_label()}"
+        if cfg.ambient_mic():
+            hint += " · or say 'Clicky'"
+        self._ptt_btn = QPushButton(hint)
         self._ptt_btn.setObjectName("hotkey_btn")
         self._ptt_btn.setFont(FONT_LABEL)
         self._ptt_btn.setFixedHeight(44)
+        self._ptt_btn.pressed.connect(self.on_push_to_talk_pressed)
+        self._ptt_btn.released.connect(self.on_push_to_talk_released)
         root.addWidget(self._ptt_btn)
 
         # Footer: model selector + provider info
@@ -274,7 +279,7 @@ class CompanionPanel(QWidget):
         # Emit the model id (stored in userData), not the display label
         self._model_combo.currentIndexChanged.connect(
             lambda _idx: self.on_model_changed.emit(
-                self._model_combo.currentData() or self._model_combo.currentText()
+                self._model_combo.currentData() or ""
             )
         )
         footer.addWidget(lbl)
@@ -302,12 +307,12 @@ class CompanionPanel(QWidget):
             except Exception:
                 self._model_combo.addItem("default", userData="default")
         else:   # ollama
-            self._model_combo.addItem(cfg.ollama_model, userData=cfg.ollama_model)
+            self._model_combo.addItem("Automatic (vision / text)", userData="")
         self._model_combo.blockSignals(False)
         # Fire once with the new default model id (NOT the display label) so
         # the manager picks it up — important when label != id.
         if self._model_combo.count():
-            self.on_model_changed.emit(self._model_combo.currentData() or self._model_combo.currentText())
+            self.on_model_changed.emit(self._model_combo.currentData() or "")
 
     def refresh_for_provider(self, provider: str):
         """Called from outside when the active provider is switched at runtime."""

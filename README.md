@@ -1,9 +1,19 @@
-# Clicky for Windows 🔵
+# Clicky 🔵
 
-> **An AI teaching companion that lives next to your cursor.**
+> **An AI teaching companion for your desktop.**
 > Ask it anything about your screen — it points, explains, and guides you step-by-step, like a real tutor sitting beside you.
 
-Clicky is a Windows port of [farzaa/clicky](https://github.com/farzaa/clicky) (originally macOS/SwiftUI). Built with **Python 3.11+ and PyQt6**, runs fully in the background, and works with every major AI provider.
+Clicky is a desktop port of [farzaa/clicky](https://github.com/farzaa/clicky)
+(originally macOS/SwiftUI). It is built with **Python 3.11+ and PyQt6**, runs
+in the background, and works with every major AI provider.
+
+**Arch Linux:** Linux adapters support X11 plus common Wayland desktops,
+including Hyprland, Sway, GNOME, and KDE Plasma. Desktop capabilities vary;
+see the [Linux setup guide](docs/LINUX_SETUP.md) and
+[architecture and migration audit](docs/LINUX_MIGRATION.md). Launch with
+`./run-linux.sh --show-panel`; the Linux talk shortcut is **Ctrl+Alt+Space**.
+Windows setup and packaging remain available below. No AccessPath features
+have been added.
 
 ---
 
@@ -17,7 +27,9 @@ Clicky is a little AI buddy that **lives next to your cursor**. Hold a hotkey, a
 
 No more Alt-Tab to ChatGPT. No more typing out descriptions of what's on your screen. Just hold **Ctrl + Win**, speak, and Clicky handles the rest.
 
-Works **100% offline** with Ollama or LM Studio, or plug in your Claude / OpenAI / Gemini / GitHub Copilot key for the full experience.
+LLM inference and Whisper speech recognition can run locally with Ollama or
+LM Studio after model downloads. Default Edge speech synthesis and enabled
+web search still require internet access. Cloud providers remain optional.
 
 ---
 

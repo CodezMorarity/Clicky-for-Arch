@@ -12,14 +12,16 @@ Backend: imageio-ffmpeg (auto-bundles ffmpeg, no system install needed).
 
 from __future__ import annotations
 
-import io
+import logging
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import mss
+from desktop.paths import recordings_dir
+from desktop import uses_portal_capture
+from screen.capture import capture_primary_image
 from PIL import Image
 
 
@@ -37,6 +39,8 @@ class LessonRecorder:
         self._t0: float = 0.0
         self._out_dir: Optional[Path] = None
         self.is_recording = False
+        self.last_error = ""
+        self.on_error = None
 
     # ── Lifecycle ───────────────────────────────────────────────────────────
 
@@ -44,6 +48,12 @@ class LessonRecorder:
         """Begin recording. Returns the output directory or None on failure."""
         if self.is_recording:
             return self._out_dir
+        if uses_portal_capture():
+            self.last_error = (
+                "Continuous lesson recording is not available through this desktop's "
+                "one-shot screenshot portal. Use a supported wlroots compositor or X11."
+            )
+            return None
 
         try:
             import imageio_ffmpeg   # noqa: F401  (required by imageio[ffmpeg])
@@ -51,21 +61,25 @@ class LessonRecorder:
         except ImportError:
             return None
 
-        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        self._out_dir = Path.home() / "Documents" / "Clicky Lessons" / ts
-        self._out_dir.mkdir(parents=True, exist_ok=True)
-
-        with mss.mss() as sct:
-            mon = sct.monitors[1]      # primary
-            w, h = mon["width"], mon["height"]
-
-        self._writer = imageio.get_writer(
-            str(self._out_dir / "lesson.mp4"),
-            fps=FPS,
-            codec="libx264",
-            quality=7,
-            macro_block_size=None,
-        )
+        self.last_error = ""
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+        self._out_dir = recordings_dir() / ts
+        try:
+            first = capture_primary_image()
+            # H.264 requires even dimensions; keep one size through hotplug.
+            self._size = (first.width // 2 * 2, first.height // 2 * 2)
+            self._out_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self._writer = imageio.get_writer(
+                str(self._out_dir / "lesson.mp4"), fps=FPS, codec="libx264",
+                quality=7, macro_block_size=None,
+            )
+            self._writer.append_data(_to_array(first.resize(self._size)))
+        except Exception as exc:
+            self.last_error = str(exc)
+            if self._writer:
+                self._writer.close()
+                self._writer = None
+            return None
         self._md_lines = [f"# Clicky Lesson — {ts}", ""]
         self._t0 = time.monotonic()
         self._stop_evt.clear()
@@ -77,21 +91,14 @@ class LessonRecorder:
 
     def stop(self) -> Optional[Path]:
         """Stop and flush. Returns the output directory."""
-        if not self.is_recording:
+        if self._thread is None:
             return None
         self._stop_evt.set()
-        if self._thread:
-            self._thread.join(timeout=3.0)
-        if self._writer:
-            try:
-                self._writer.close()
-            except Exception:
-                pass
-            self._writer = None
-        if self._out_dir:
-            (self._out_dir / "transcript.md").write_text(
-                "\n".join(self._md_lines), encoding="utf-8"
-            )
+        self._thread.join(timeout=12.0)
+        if self._thread.is_alive():
+            self.last_error = "Recorder is still flushing; please wait before quitting."
+            return None
+        self._thread = None
         self.is_recording = False
         return self._out_dir
 
@@ -109,24 +116,26 @@ class LessonRecorder:
     # ── Internal ────────────────────────────────────────────────────────────
 
     def _loop(self):
-        with mss.mss() as sct:
-            mon = sct.monitors[1]
-            interval = 1.0 / FPS
-            next_t = time.monotonic()
+        interval = 1.0 / FPS
+        try:
             while not self._stop_evt.is_set():
-                try:
-                    raw = sct.grab(mon)
-                    img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
-                    if self._writer is not None:
-                        self._writer.append_data(_to_array(img))
-                except Exception:
-                    pass
-                next_t += interval
-                sleep_left = next_t - time.monotonic()
-                if sleep_left > 0:
-                    time.sleep(sleep_left)
-                else:
-                    next_t = time.monotonic()
+                started = time.monotonic()
+                img = capture_primary_image().resize(self._size)
+                self._writer.append_data(_to_array(img))
+                self._stop_evt.wait(max(0, interval - (time.monotonic() - started)))
+        except Exception as exc:
+            self.last_error = str(exc)
+            logging.getLogger("clicky.recorder").exception("Recording failed")
+            if self.on_error:
+                self.on_error(self.last_error)
+        finally:
+            try:
+                self._writer.close()
+            finally:
+                self._writer = None
+                (self._out_dir / "transcript.md").write_text(
+                    "\n".join(self._md_lines), encoding="utf-8")
+                self.is_recording = False
 
 
 def _to_array(img: Image.Image):

@@ -27,6 +27,7 @@ from __future__ import annotations
 import os
 import threading
 from pathlib import Path
+from desktop.paths import ensure_data_dir
 
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (
@@ -35,14 +36,12 @@ from PyQt6.QtWidgets import (
 
 from ai import ollama_bootstrap as ob
 from config import cfg
+from desktop import is_windows
 
 
 # Marker file: the wizard skips itself if this exists.
 def _flag_path() -> Path:
-    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    d = Path(base) / "Clicky"
-    d.mkdir(parents=True, exist_ok=True)
-    return d / "setup_complete.flag"
+    return ensure_data_dir() / "setup_complete.flag"
 
 
 def setup_already_ran() -> bool:
@@ -181,8 +180,8 @@ class SetupWizard(QDialog):
                 "Clicky is an AI tutor that lives next to your cursor and can see "
                 "your screen — so it can point at things instead of just describing "
                 "them.\n\n"
-                f"•  Hold {_pretty_hotkey()} anywhere in Windows, or just say "
-                "\"Clicky\", then ask your question out loud.\n"
+                f"•  Hold or tap {_pretty_hotkey()} on your desktop and speak. "
+                "Enable the wake word in the tray for hands-free use.\n"
                 "•  Clicky answers by speaking, and draws arrows, circles and "
                 "labels directly on your screen.\n"
                 "•  Ask it about whatever you're looking at — a PDF, an error "
@@ -226,6 +225,9 @@ class SetupWizard(QDialog):
                 "AI locally — we'll download and install it for you (≈700 MB)."
             )
             self.action_btn.setText("Install Ollama")
+            if not is_windows():
+                self.subtitle.setText(ob.linux_install_hint())
+                self.action_btn.setText("Check again")
 
         elif step == "installing":
             self.title.setText("Installing Ollama…")
@@ -318,12 +320,17 @@ class SetupWizard(QDialog):
             self._set_step("engine")
 
         elif s == "engine":
+            cfg.set_active_llm("ollama")
             self._set_step("detect")
             self._start_detect_worker()
 
         elif s == "install":
-            self._set_step("installing")
-            self._start_install_worker()
+            if is_windows():
+                self._set_step("installing")
+                self._start_install_worker()
+            else:
+                self._set_step("detect")
+                self._start_detect_worker()
 
         elif s == "text_model":
             self._set_step("pulling_text")
@@ -386,8 +393,8 @@ class SetupWizard(QDialog):
                     self.finished_signal.emit(
                         ok,
                         "running" if ok else
-                        "Ollama is installed but wouldn't start. Open it from the "
-                        "Start menu, then click Try again."
+                        "Ollama is installed but wouldn't start. Run ollama serve "
+                        "in a terminal, then click Check again."
                     )
                     return
                 self.finished_signal.emit(False, "missing")
@@ -459,6 +466,9 @@ class SetupWizard(QDialog):
             return
 
         if not ok:
+            retry_step = {"installing": "install", "pulling_text": "text_model",
+                          "pulling_vision": "vision_model"}.get(s, s)
+            self._set_step(retry_step)
             self.status.setText(f"⚠️ {msg}")
             self.action_btn.setEnabled(True)
             self.skip_btn.setEnabled(True)

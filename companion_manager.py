@@ -7,6 +7,7 @@ Orchestrates:
 """
 
 import asyncio
+import concurrent.futures
 import logging
 import math
 import re
@@ -18,6 +19,7 @@ from typing import List, Optional
 
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from desktop import uses_portal_capture
 from config import cfg
 from ai.base_provider import BaseLLMProvider, Message
 from audio.ambient_listener import AmbientListener
@@ -39,50 +41,9 @@ _log = logging.getLogger("clicky.manager")
 
 
 def _ensure_ollama_running():
-    """Start Ollama if it isn't already running. Waits up to 8 s for it to be ready."""
-    import subprocess
-    import urllib.request
-
-    url = "http://localhost:11434/api/tags"
-    for _ in range(2):
-        try:
-            urllib.request.urlopen(url, timeout=2)
-            return  # already up
-        except Exception:
-            pass
-
-    # API down. If an ollama process already exists, don't spawn a second
-    # `ollama serve` — duplicate instances fight over the port and wedge the
-    # API entirely. Just wait for the existing one below.
-    already_running = False
-    try:
-        out = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq ollama.exe", "/FO", "CSV", "/NH"],
-            capture_output=True, text=True, timeout=5,
-        ).stdout
-        already_running = "ollama.exe" in out.lower()
-    except Exception:
-        pass
-
-    if not already_running:
-        try:
-            subprocess.Popen(
-                ["ollama", "serve"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
-            )
-        except FileNotFoundError:
-            return  # ollama not installed, provider will fail gracefully
-
-    # Wait up to 8 s for the server to come up
-    for _ in range(16):
-        time.sleep(0.5)
-        try:
-            urllib.request.urlopen(url, timeout=1)
-            return
-        except Exception:
-            pass
+    """Use the shared bootstrap, including configured host and OS handling."""
+    from ai.ollama_bootstrap import ensure_ollama_running
+    return ensure_ollama_running(timeout=8)
 
 
 def _build_system_prompt(
@@ -283,8 +244,12 @@ class CompanionManager(QObject):
         self._tts = None
 
         # Current in-flight generation — tracked so Esc / stop can cancel
-        self._current_task: Optional[asyncio.Future] = None
         self._cancel_flag = False
+        self._loop_ready = threading.Event()
+        self._shutdown_event = threading.Event()
+        self._request_tasks = set()
+        self._capture_generation = 0
+        self._stopping = False
 
         # Push-to-talk bookkeeping. A capture can be ended either by releasing
         # the hotkey (hold) or by the silence watchdog (tap) — whichever gets
@@ -358,6 +323,8 @@ class CompanionManager(QObject):
         # Background asyncio loop
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
+        if not self._loop_ready.wait(timeout=5):
+            raise RuntimeError("Clicky's background loop did not start.")
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -382,33 +349,50 @@ class CompanionManager(QObject):
         except Exception:
             pass   # silent — not user-facing on startup
 
-    def shutdown(self):
-        # Kill any audio that was playing when the user clicked Quit
+    def _capture_screens_safely(self):
         try:
-            from audio.playback import stop_audio
-            stop_audio()
-        except Exception:
-            pass
+            return capture_all_screens()
+        except Exception as exc:
+            _log.info("screen capture unavailable: %s", exc)
+            self.sig_error.emit(f"Screen capture unavailable: {exc}")
+            return []
+
+    def shutdown(self):
+        if self._shutdown_event.is_set():
+            return
+        self._shutdown_event.set()
+        self.stop()
         self._listener.stop()
-        # Close the provider's HTTP pool while the loop is still alive —
-        # once it stops, the coroutine can never run. Bounded so a hung
-        # socket cannot delay quitting.
-        closer = getattr(self._llm, "close", None)
-        if callable(closer) and self._loop and self._loop.is_running():
-            try:
-                asyncio.run_coroutine_threadsafe(
-                    self._llm.close(), self._loop
-                ).result(timeout=3)
-            except Exception:
-                _log.debug("closing provider on shutdown failed", exc_info=True)
-        self._llm = None
+        if self._recorder:
+            self._recorder.stop()
+        if self._workflow:
+            self._workflow.stop()
         if self._loop and self._loop.is_running():
-            self._loop.call_soon_threadsafe(self._loop.stop)
+            async def finish():
+                tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                if self._llm and callable(getattr(self._llm, "close", None)):
+                    await self._llm.close()
+                await self._loop.shutdown_asyncgens()
+            try:
+                asyncio.run_coroutine_threadsafe(finish(), self._loop).result(timeout=5)
+            except Exception:
+                _log.debug("closing background tasks failed", exc_info=True)
+            finally:
+                self._loop.call_soon_threadsafe(self._loop.stop)
+                self._thread.join(timeout=6)
+        self._llm = None
 
     def _run_loop(self):
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
-        self._loop.run_forever()
+        self._loop.call_soon(self._loop_ready.set)
+        try:
+            self._loop.run_forever()
+        finally:
+            self._loop.close()
 
     # ── Sleep/wake watchdog ───────────────────────────────────────────────────
 
@@ -418,10 +402,9 @@ class CompanionManager(QObject):
         def _watch():
             HEARTBEAT = 5.0          # check every 5 s
             DRIFT_THRESHOLD = 15.0   # if we wake and >15 s have passed, resume occurred
-            last_tick = time.monotonic()
-            while True:
-                time.sleep(HEARTBEAT)
-                now = time.monotonic()
+            last_tick = time.time()
+            while not self._shutdown_event.wait(HEARTBEAT):
+                now = time.time()
                 drift = now - last_tick - HEARTBEAT
                 last_tick = now
                 if drift > DRIFT_THRESHOLD:
@@ -438,7 +421,8 @@ class CompanionManager(QObject):
             self._listener.stop()
         except Exception:
             pass
-        time.sleep(1.0)   # give Windows audio stack time to reinit
+        if self._shutdown_event.wait(1.0):
+            return
         try:
             self._listener.start()
         except Exception as e:
@@ -453,14 +437,31 @@ class CompanionManager(QObject):
         if self._state != AppState.IDLE:
             self._emit_state(AppState.IDLE)
 
-    def _submit(self, coro):
-        if not self._loop:
-            return
+    def _submit(self, coro, *, request=False):
+        if not self._loop or not self._loop.is_running() or self._shutdown_event.is_set():
+            coro.close()
+            return None
+        if request:
+            generation = self._capture_generation
+            original = coro
+            async def tracked():
+                if generation != self._capture_generation:
+                    original.close()
+                    return
+                task = asyncio.current_task()
+                self._request_tasks.add(task)
+                try:
+                    return await original
+                finally:
+                    self._request_tasks.discard(task)
+            coro = tracked()
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
 
         def _observe(f):
             try:
                 f.result()
+            except concurrent.futures.CancelledError:
+                return
             except Exception as e:
                 # A swallowed exception here used to leave the UI stuck on
                 # "Listening..." forever (GitHub issue #6). Surface it and
@@ -472,6 +473,7 @@ class CompanionManager(QObject):
                 except Exception:
                     pass
         fut.add_done_callback(_observe)
+        return fut
 
     def _retire_llm(self) -> None:
         """Drop the active provider and close its pooled HTTP client.
@@ -578,7 +580,7 @@ class CompanionManager(QObject):
         self._begin_capture()
         # Arm the silence watchdog straight away. If this turns out to be a
         # hold rather than a tap, on_hotkey_release claims the end first.
-        self._submit(self._auto_stop_on_silence())
+        self._submit(self._auto_stop_on_silence(), request=True)
 
     def on_hotkey_release(self):
         if self._state != AppState.LISTENING:
@@ -589,14 +591,14 @@ class CompanionManager(QObject):
             # speaking. The watchdog ends the capture on silence.
             return
         if self._claim_end():
-            self._submit(self._end_capture_and_process())
+            self._submit(self._end_capture_and_process(), request=True)
 
     def _handle_wake(self):
         """Triggered from ambient listener when wake-word is detected."""
         if not self._claim_begin():
             return
         self._begin_capture()
-        self._submit(self._auto_stop_on_silence())
+        self._submit(self._auto_stop_on_silence(), request=True)
 
     def _claim_begin(self) -> bool:
         """Exactly one of {hotkey press, wake word} may open a capture.
@@ -605,7 +607,7 @@ class CompanionManager(QObject):
         cannot also observe IDLE and start a parallel capture.
         """
         with self._begin_lock:
-            if self._state != AppState.IDLE:
+            if self._state != AppState.IDLE or self._stopping or self._shutdown_event.is_set():
                 return False
             self._state = AppState.LISTENING
             return True
@@ -628,6 +630,8 @@ class CompanionManager(QObject):
     # ── Capture flow ──────────────────────────────────────────────────────────
 
     def _begin_capture(self):
+        self._cancel_flag = False
+        self._capture_generation += 1
         self._end_claimed = False
         self._last_rms = 0.0
         # Silence anything still playing from the previous turn. Without this
@@ -665,11 +669,12 @@ class CompanionManager(QObject):
         This watches the live mic level instead: wait for speech to start,
         then end on a sustained pause.
         """
+        generation = self._capture_generation
         start_t = time.monotonic()
         speech_started = False
         silence_from: Optional[float] = None
 
-        while self._state == AppState.LISTENING:
+        while self._state == AppState.LISTENING and generation == self._capture_generation:
             await asyncio.sleep(0.05)
             now = time.monotonic()
 
@@ -687,10 +692,14 @@ class CompanionManager(QObject):
             if now - start_t > self._MAX_UTTERANCE_S:
                 break
 
-        if self._claim_end():
+        if (generation == self._capture_generation and self._state == AppState.LISTENING
+                and self._claim_end()):
             await self._end_capture_and_process()
 
     async def _end_capture_and_process(self):
+        if self._cancel_flag or self._state != AppState.LISTENING:
+            return
+        search_task = locate_task = None
         try:
             pcm = self._listener.stop_recording()
         except Exception as e:
@@ -793,12 +802,15 @@ class CompanionManager(QObject):
             # from training data + web search instead, which is what the user
             # actually wants when they ask "who is MrBeast" while on YouTube.
             sensitive = self._privacy_guard and is_sensitive_window(title)
+            # Desktops without an active-window API use the interactive
+            # screenshot portal, so the user approves each capture explicitly.
+            portal_approval = title is None and uses_portal_capture()
             identity_q = is_identity_question(transcript)
-            if sensitive or identity_q:
+            if (sensitive and not portal_approval) or identity_q:
                 screenshots = []
                 images_b64 = []
             else:
-                screenshots = capture_all_screens()
+                screenshots = await asyncio.to_thread(self._capture_screens_safely)
                 images_b64 = [s.base64_jpeg for s in screenshots]
             # Fresh question → wipe the previous lesson's drawings and remember
             # this turn's screenshots for coordinate mapping.
@@ -845,8 +857,8 @@ class CompanionManager(QObject):
                 # below only when both whiff.
                 try:
                     from ai.hybrid_pointer import find_target as _hybrid_find
-                    target = _hybrid_find(
-                        transcript,
+                    target = await asyncio.to_thread(
+                        _hybrid_find, _guess_label(transcript),
                         screenshot=shot,
                         llm_provider=self._get_llm(),
                     )
@@ -854,14 +866,8 @@ class CompanionManager(QObject):
                     target = None
 
                 if target is not None and target.source in ("uia", "ocr"):
-                    # UIA / OCR coordinates are PHYSICAL pixels; the overlay
-                    # draws in LOGICAL pixels — divide by the DPI scale.
-                    # (Also: return an object with .x/.y — downstream code
-                    # accesses attributes, a bare tuple would crash it.)
-                    from types import SimpleNamespace
-                    _scale = shot.dpi_scale or 1.0
-                    _pt = SimpleNamespace(x=target.x / _scale,
-                                          y=target.y / _scale)
+                    # Hybrid targets already include DPI and monitor origin.
+                    _pt = target
                     async def _ready(pt=_pt):
                         return pt
                     locate_task = asyncio.create_task(_ready())
@@ -877,6 +883,8 @@ class CompanionManager(QObject):
                         physical_left=shot.physical_left,
                         physical_top=shot.physical_top,
                         dpi_scale=shot.dpi_scale,
+                        logical_left=shot.logical_left,
+                        logical_top=shot.logical_top,
                         screen_index=shot.index,
                         user_question=transcript,
                     ))
@@ -895,6 +903,8 @@ class CompanionManager(QObject):
                             physical_left=shot.physical_left,
                             physical_top=shot.physical_top,
                             dpi_scale=shot.dpi_scale,
+                            logical_left=shot.logical_left,
+                            logical_top=shot.logical_top,
                             screen_index=shot.index,
                             user_question=transcript,
                             model=self._current_model,
@@ -985,7 +995,6 @@ class CompanionManager(QObject):
             # 5. Stream LLM — buffer partial [POINT:...] tags so they never leak
             full_response = ""
             display_buf = ""
-            self._cancel_flag = False
             async for chunk in self._get_llm().stream_response(
                 user_text=transcript,
                 screenshots_b64=images_b64,
@@ -1085,6 +1094,11 @@ class CompanionManager(QObject):
             self.sig_error.emit(str(e))
 
         finally:
+            for task in (search_task, locate_task):
+                if task and not task.done():
+                    task.cancel()
+            await asyncio.gather(*(t for t in (search_task, locate_task) if t),
+                                 return_exceptions=True)
             if pointing_held:
                 self.sig_point_release.emit()
             self._emit_state(AppState.IDLE)
@@ -1191,13 +1205,11 @@ class CompanionManager(QObject):
         """Resolve '@element name' → logical bbox via UIA (fast tier only)."""
         try:
             from ai.hybrid_pointer import find_target
-            t = find_target(name, skip_ocr=True, skip_vision=True)
-            if t is None:
-                return None
             shot = self._shot(1)
-            scale = (shot.dpi_scale if shot else 1.0) or 1.0
-            l, tp, r, b = t.bbox
-            return (l / scale, tp / scale, r / scale, b / scale)
+            if shot is None:
+                return None
+            t = find_target(name, screenshot=shot, skip_vision=True)
+            return t.bbox if t else None
         except Exception:
             return None
 
@@ -1508,9 +1520,10 @@ class CompanionManager(QObject):
         cfg.custom_instructions = text.strip()
         try:
             from dotenv import set_key
-            env_path = Path(__file__).parent / ".env"
+            env_path = cfg.env_path()
+            env_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             if not env_path.exists():
-                env_path.touch()
+                env_path.touch(mode=0o600)
             escaped = text.strip().replace("\n", "\\n")
             set_key(str(env_path), "CUSTOM_INSTRUCTIONS", escaped)
         except Exception as e:
@@ -1529,8 +1542,9 @@ class CompanionManager(QObject):
         try:
             from dotenv import set_key
             env_path = cfg.env_path()
+            env_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             if not env_path.exists():
-                env_path.touch()
+                env_path.touch(mode=0o600)
             set_key(str(env_path), "WHISPER_LANGUAGE", code)
         except Exception:
             pass
@@ -1542,9 +1556,10 @@ class CompanionManager(QObject):
         cfg.response_language = code
         try:
             from dotenv import set_key
-            env_path = Path(__file__).parent / ".env"
+            env_path = cfg.env_path()
+            env_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             if not env_path.exists():
-                env_path.touch()
+                env_path.touch(mode=0o600)
             set_key(str(env_path), "RESPONSE_LANGUAGE", code)
         except Exception as e:
             self.sig_error.emit(f"Could not save language setting: {e}")
@@ -1611,7 +1626,7 @@ class CompanionManager(QObject):
         if enabled and not was:
             # Kick off the first question immediately so the user doesn't
             # have to ask "begin quiz". Uses the active screen as context.
-            self._submit(self._kickoff_quiz())
+            self._submit(self._kickoff_quiz(), request=True)
 
     async def _kickoff_quiz(self):
         """Called when quiz mode flips ON — generates the first question
@@ -1620,9 +1635,13 @@ class CompanionManager(QObject):
             return
         try:
             self._emit_state(AppState.THINKING)
-            screenshots = capture_all_screens()
-            images_b64 = [s.base64_jpeg for s in screenshots]
+            self._cancel_flag = False
             title = active_window_title()
+            sensitive = self._privacy_guard and is_sensitive_window(title)
+            portal_approval = title is None and uses_portal_capture()
+            screenshots = ([] if sensitive and not portal_approval else
+                           await asyncio.to_thread(self._capture_screens_safely))
+            images_b64 = [s.base64_jpeg for s in screenshots]
             system = _build_system_prompt(
                 window_title=title, quiz_mode=True,
             )
@@ -1688,14 +1707,17 @@ class CompanionManager(QObject):
     def start_recording(self) -> Optional[str]:
         if self._recorder is None:
             self._recorder = lesson_recorder.LessonRecorder()
+            self._recorder.on_error = self.sig_error.emit
         out = self._recorder.start()
+        if not out and self._recorder.last_error:
+            self.sig_error.emit(self._recorder.last_error)
         if out:
             self.sig_recording_state.emit(True, str(out))
             return str(out)
         return None
 
     def stop_recording(self) -> Optional[str]:
-        if not self._recorder or not self._recorder.is_recording:
+        if not self._recorder:
             return None
         out = self._recorder.stop()
         self.sig_recording_state.emit(False, str(out) if out else "")
@@ -1762,7 +1784,17 @@ class CompanionManager(QObject):
 
     def stop(self):
         """Cancel the current LLM stream + any in-flight TTS. Bound to Esc."""
+        if self._stopping:
+            return
+        self._stopping = True
         self._cancel_flag = True
+        self._capture_generation += 1
+        self._end_claimed = True
+        if self._state == AppState.LISTENING:
+            try:
+                self._listener.stop_recording()
+            except Exception:
+                _log.debug("stopping microphone failed", exc_info=True)
         # Kill audio playback immediately — flips the global stop event so
         # the chunked PortAudio loop bails out within ~50 ms.
         try:
@@ -1780,4 +1812,16 @@ class CompanionManager(QObject):
         # Clear any stored lesson so "stop" really means "back to zero"
         self._lesson_steps = []
         self._lesson_step_idx = 0
-        self._emit_state(AppState.IDLE)
+        async def cancel_requests():
+            tasks = list(self._request_tasks)
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._stopping = False
+            self.sig_point_release.emit()
+            self._emit_state(AppState.IDLE)
+        if self._loop and self._loop.is_running():
+            asyncio.run_coroutine_threadsafe(cancel_requests(), self._loop)
+        else:
+            self._stopping = False
+            self._emit_state(AppState.IDLE)

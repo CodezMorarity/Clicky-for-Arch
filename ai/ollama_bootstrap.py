@@ -26,8 +26,11 @@ from pathlib import Path
 from typing import Callable, List, Optional
 
 import httpx
+from urllib.parse import urlparse
 
 from config import cfg
+from desktop import is_windows
+from desktop.paths import ensure_data_dir
 
 
 OLLAMA_DOWNLOAD_URL = "https://ollama.com/download/OllamaSetup.exe"
@@ -62,6 +65,9 @@ def find_ollama_binary() -> Optional[Path]:
     if on_path:
         return Path(on_path)
 
+    if not is_windows():
+        return None
+
     candidates = []
     for env_var in ("LOCALAPPDATA", "PROGRAMFILES", "PROGRAMW6432"):
         base = os.environ.get(env_var)
@@ -95,19 +101,23 @@ def start_ollama_server() -> bool:
     if exe is None:
         return False
 
+    host = urlparse(cfg.ollama_host)
+    if host.hostname not in ("localhost", "127.0.0.1", "::1"):
+        return False
     app_exe = exe.with_name("ollama app.exe")
-    cmd = [str(app_exe)] if app_exe.is_file() else [str(exe), "serve"]
+    cmd = [str(app_exe)] if is_windows() and app_exe.is_file() else [str(exe), "serve"]
 
     # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP — outlives Clicky and never
     # shows a console window.
-    creationflags = 0x00000008 | 0x00000200
+    process_options = ({"creationflags": 0x00000008 | 0x00000200}
+                       if is_windows() else {"start_new_session": True})
     try:
         subprocess.Popen(
             cmd,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
-            creationflags=creationflags,
+            **process_options,
             close_fds=True,
         )
         return True
@@ -147,12 +157,8 @@ def is_model_installed(name: str) -> bool:
     if not name:
         return False
     installed = list_installed_models()
-    # Ollama returns tags like 'llama3.2:3b'. Match by exact tag *or* base name
-    # so callers can pass either 'llama3.2' or 'llama3.2:3b'.
-    if name in installed:
-        return True
-    base = name.split(":", 1)[0]
-    return any(m.split(":", 1)[0] == base for m in installed)
+    canonical = name if ":" in name.rsplit("/", 1)[-1] else name + ":latest"
+    return canonical in installed or name in installed
 
 
 # ─── Pull a model with progress ───────────────────────────────────────────────
@@ -187,6 +193,8 @@ def pull_model(
                 except Exception:
                     continue
 
+                if msg.get("error"):
+                    raise RuntimeError(msg["error"])
                 status = msg.get("status", "")
                 total = msg.get("total")
                 done = msg.get("completed")
@@ -205,7 +213,7 @@ def pull_model(
 
                 if status == "success":
                     return True
-        return True
+        raise RuntimeError("Model download ended before Ollama reported success; try again to resume.")
     except Exception as e:
         if on_progress:
             on_progress(f"error: {e}", 0.0)
@@ -215,8 +223,7 @@ def pull_model(
 # ─── Installer download / run ─────────────────────────────────────────────────
 
 def _default_installer_path() -> Path:
-    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    d = Path(base) / "Clicky" / "downloads"
+    d = ensure_data_dir() / "downloads"
     d.mkdir(parents=True, exist_ok=True)
     return d / "OllamaSetup.exe"
 
@@ -226,6 +233,8 @@ def download_ollama_installer(
     on_progress: Optional[Callable[[float], None]] = None,
 ) -> Path:
     """Download the official Ollama installer. Returns the local path on success."""
+    if not is_windows():
+        raise RuntimeError(linux_install_hint())
     target = Path(dest) if dest else _default_installer_path()
     tmp = target.with_suffix(target.suffix + ".part")
 
@@ -254,11 +263,19 @@ def run_ollama_installer(path: Path, silent: bool = False) -> int:
     If silent=True we use Ollama's silent install flag (/SILENT). The official
     Ollama installer is an Inno Setup wizard so it accepts the standard flags.
     """
+    if not is_windows():
+        raise RuntimeError(linux_install_hint())
     args: List[str] = [str(path)]
     if silent:
         args.append("/SILENT")
     proc = subprocess.run(args, shell=False)
     return proc.returncode
+
+
+def linux_install_hint() -> str:
+    return ("Install Ollama in a terminal: omarchy pkg add ollama "
+            "(or sudo pacman -S ollama on Arch). For NVIDIA acceleration, "
+            "also install ollama-cuda. Then run ollama serve and click Check again.")
 
 
 def wait_for_ollama_server(timeout: float = 60.0, poll_interval: float = 1.0) -> bool:
